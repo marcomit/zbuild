@@ -75,10 +75,25 @@
 #ifndef ZVEC_H
 #define ZVEC_H
 
-#include "base.h"
-#include "zmem.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
+
+#define vec(T) T *
+
+// create a version which works also without zmem.h
+#ifdef ZVEC_USE_ZMEM
+#define VECALLOC(a, s) aalloc(a, s)
+#define VECREALLOC(a, p, s) arealloc(a, p, s)
+#define VECFREE(a, p) afree(a, p)
+#else
+typedef struct Allocator Allocator;
+static Allocator *vecDefaultAllocator       = NULL;
+static Allocator *heapAllocator             = NULL;
+#define VECALLOC(a, s) malloc(s)
+#define VECREALLOC(a, p, s) realloc(p, s)
+#define VECFREE(a, p) free(p)
+#endif
 
 
 /* ============================================================================
@@ -100,7 +115,7 @@
  * @param v Vector pointer
  * @return Pointer to vec_metadata structure
  */
-#define VEC_METADATA(v) ((vec_metadata *)((u8 *)(v) - sizeof(vec_metadata)))
+#define VEC_METADATA(v) ((vec_metadata *)((uint8_t *)(v) - sizeof(vec_metadata)))
 
 /**
  * @internal
@@ -111,11 +126,11 @@
  */
 #define VEC_REALLOC_IMPL(v, new_capacity_bytes) ({                                                      \
     vec_metadata *old_meta = VEC_METADATA(v);                                                           \
-    usize used_bytes = sizeof(vec_metadata) + old_meta->length * sizeof(*(v));                          \
-    vec_metadata *new_meta = aalloc(old_meta->allocator, sizeof(vec_metadata) + (new_capacity_bytes));  \
+    size_t used_bytes = sizeof(vec_metadata) + old_meta->length * sizeof(*(v));                         \
+    vec_metadata *new_meta = VECALLOC(old_meta->allocator, sizeof(vec_metadata) + (new_capacity_bytes));\
     if (new_meta) {                                                                                     \
         memcpy(new_meta, old_meta, used_bytes);                                                         \
-        afree(old_meta->allocator, old_meta);                                                           \
+        VECFREE(old_meta->allocator, old_meta);                                                         \
     }                                                                                                   \
     (new_meta ? (void *)(new_meta + 1) : NULL);                                                         \
 })
@@ -127,7 +142,7 @@
 /**
  * @brief Get the current capacity of a vector (number of elements)
  * @param v Vector pointer
- * @return Capacity as usize
+ * @return Capacity as size_t
  * @note Returns number of elements, not bytes
  */
 #define veccap(v) (VEC_METADATA(v)->capacity)
@@ -135,7 +150,7 @@
 /**
  * @brief Get the current length of a vector (number of elements)
  * @param v Vector pointer
- * @return Length as usize
+ * @return Length as size_t
  */
 #define veclen(v) ((v) ? VEC_METADATA(v)->length : 0)
 
@@ -181,7 +196,7 @@ do {                                                                            
     }                                                                           \
     if (!(v)) break;                                                            \
     if (veclen(v) >= veccap(v)) {                                               \
-        usize new_cap = veccap(v) << 1;                                         \
+        size_t new_cap = veccap(v) << 1;                                        \
         void *new_v = VEC_REALLOC_IMPL((v), new_cap * sizeof(*(v)));            \
         if (!(new_v)) break;                                                    \
         (v) = new_v;                                                            \
@@ -211,7 +226,7 @@ do {                                                                            
 #define vecfree(v)                                                              \
 do {                                                                            \
     if ((v)) {                                                                  \
-        afree(VEC_METADATA(v)->allocator, VEC_METADATA(v));                     \
+        VECFREE(VEC_METADATA(v)->allocator, VEC_METADATA(v));                   \
         (v) = NULL;                                                             \
     }                                                                           \
 } while (0)
@@ -284,7 +299,7 @@ do {                                                                            
 
 #define vecunion(v, r, n)                                                       \
 do {                                                                            \
-    for (usize vecunionIndex = 0; vecunionIndex < (n); vecunionIndex++) {       \
+    for (size_t vecunionIndex = 0; vecunionIndex < (n); vecunionIndex++) {      \
         vecpush(v, r[vecunionIndex]);                                           \
     }                                                                           \
 } while(0)
@@ -300,11 +315,9 @@ do {                                                                            
  * It stores the vector's capacity and current length.
  */
 typedef struct vec_metadata {
-#ifdef ZMEM_H
     Allocator   *allocator; /**< Allocator the vector was created with, used for every growth and free */
-#endif
-    usize       capacity;   /**< Maximum number of elements before reallocation */
-    usize       length;     /**< Current number of elements in the vector */
+    size_t       capacity;   /**< Maximum number of elements before reallocation */
+    size_t       length;     /**< Current number of elements in the vector */
 } vec_metadata;
 
 /* ============================================================================
@@ -318,11 +331,13 @@ typedef struct vec_metadata {
  * @param capacity Minimum capacity; never less than VEC_DEFAULT_SIZE
  * @return Pointer to the vector data, or NULL on allocation failure
  */
-static inline void *veccreatecap(Allocator *allocator, usize element_size, usize capacity) {
+static inline void *veccreatecap(Allocator *allocator, size_t element_size, size_t capacity) {
+    #ifdef ZVEC_USE_ZMEM
     if (!allocator) return NULL;
+    #endif
     if (capacity < VEC_DEFAULT_SIZE) capacity = VEC_DEFAULT_SIZE;
-    usize total_bytes = sizeof(vec_metadata) + (capacity * element_size);
-    vec_metadata *metadata = (vec_metadata *)aalloc(allocator, total_bytes);
+    size_t total_bytes = sizeof(vec_metadata) + (capacity * element_size);
+    vec_metadata *metadata = (vec_metadata *)VECALLOC(allocator, total_bytes);
 
     if (!metadata) return NULL;
     metadata->capacity  = capacity;
@@ -344,7 +359,7 @@ static inline void *veccreatecap(Allocator *allocator, usize element_size, usize
  * int *vec = veccreatewith(heapAllocator, sizeof(int));
  * @endcode
  */
-static inline void *veccreatewith(Allocator *allocator, usize element_size) {
+static inline void *veccreatewith(Allocator *allocator, size_t element_size) {
     return veccreatecap(allocator, element_size, VEC_DEFAULT_SIZE);
 }
 
