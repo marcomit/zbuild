@@ -12,10 +12,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <dirent.h>
+#include <sys/wait.h>
 
 #if defined(_WIN32)
 #   include <windows.h>
-#   include <dirent.h>
 #   define MKDIR(path) _mkdir(path)
 #   define popen _popen
 #   define pclose _pclose
@@ -76,8 +77,20 @@ struct ZCmd {
 };
 
 static inline void zb_cmd_free(ZCmd *);
-static inline int is_out_of_date(ZCmd *);
+static inline int zb_is_out_of_date(ZCmd *);
 static inline char *zb_get_cmd(ZCmd *);
+static inline const char *zb_mkdir(const char *);
+
+static inline bool zb_starts_with(const char *src, const char *prefix) {
+    return strncmp(src, prefix, strlen(prefix)) == 0;
+}
+
+static inline bool zb_ends_with(const char *src, const char *suffix) {
+    size_t suffix_len   = strlen(suffix);
+    size_t src_len      = strlen(src);
+    if (suffix_len > src_len) return false;
+    return strcmp(src + (src_len - suffix_len), suffix) == 0;
+}
 
 static inline int cpu_count() {
 #if defined(_WIN32)
@@ -127,14 +140,37 @@ static inline int zb_has_cycle(ZCmd *cmd) {
     return 0;
 }
 
-static inline int zb_run_cmd(ZBuild *b, ZCmd *c) {
+static inline int zb_run_command(ZBuild *b, ZCmd *c) {
+    const char *cmd = zb_get_cmd(c);
+    if (b->show_command) {
+        printf("[zb]: %s\n", cmd);
+    }
+
+#ifdef _WIN32
+    char slash = '\\';
+#else
+    char slash = '/';
+#endif
+    
+    for (size_t i = 0; i < veclen(c->outputs); i++) {
+        const char *last_slash = strrchr(c->outputs[i], slash);
+        if (!last_slash) continue;
+        char *path = strndup(c->outputs[i], last_slash - c->outputs[i]);
+        zb_mkdir(path);
+        free(path);
+    }
+
+    return system(cmd);
+}
+
+static inline int zb_walk_cmd(ZBuild *b, ZCmd *c) {
     if (c->state & Z_CMD_END_MASK) return 0;
     c->state = Z_CMD_RUNNING;
 
     size_t i = 0;
     for (; i < veclen(c->after); i++) {
-        if (!is_out_of_date(c->after[i])) continue;
-        if (!zb_run_cmd(b, c->after[i])) {
+        if (!zb_is_out_of_date(c->after[i])) continue;
+        if (!zb_walk_cmd(b, c->after[i])) {
             c->state = Z_CMD_SKIPPED;
             break;
         }
@@ -152,12 +188,8 @@ static inline int zb_run_cmd(ZBuild *b, ZCmd *c) {
         }
         return 0;
     }
-    const char *cmd = zb_get_cmd(c);
-    if (b->show_command) {
-        printf("[zb]: %s\n", cmd);
-    }
 
-    int code = system(cmd);
+    int code = zb_run_command(b, c);
     if (code != 0) {
         c->state = Z_CMD_FAILED;
         return 0;
@@ -185,8 +217,8 @@ static inline ZBuildState zb_run(ZBuild *b) {
 
     int flag = 0;
     for (size_t i = 0; i < veclen(b->cmds); i++) {
-        if (is_out_of_date(b->cmds[i])) {
-            if (!zb_run_cmd(b, b->cmds[i])) {
+        if (zb_is_out_of_date(b->cmds[i])) {
+            if (!zb_walk_cmd(b, b->cmds[i])) {
                 return Z_BUILD_GENERIC_ERROR;
             }
             flag = 1;
@@ -203,6 +235,7 @@ static inline void zb_clean(ZBuild *b) {
     for (size_t i = 0; i < veclen(b->cmds); i++) {
          ZCmd *c = b->cmds[i];
          for (size_t j = 0; j < veclen(c->outputs); j++) {
+            printf("[zb]: Removing %s\n", c->outputs[j]);
             remove(c->outputs[j]);
         }
     }
@@ -242,22 +275,27 @@ static inline long long file_mtime(const char *path) {
  * which is newer than any output:
  * conceptually: newest input < oldest input
  * */
-static inline int is_out_of_date(ZCmd *cmd) {
+static inline int zb_is_out_of_date(ZCmd *cmd) {
     size_t in_len = veclen(cmd->inputs);
     size_t out_len = veclen(cmd->outputs);
 
-    if (in_len == 0 || out_len == 0) return 0;
+    if (in_len == 0 || out_len == 0) return 1;
 
     long long newest_input  = file_mtime(cmd->inputs[0]);
     long long oldest_output = file_mtime(cmd->outputs[0]);
 
+    if (newest_input == -1 || oldest_output == -1)
+        return 1;
+    
     for (size_t i = 1; i < in_len; i++) {
         long long cur = file_mtime(cmd->inputs[i]);
+        if (cur == -1) return 1;
         if (cur > newest_input) newest_input = cur;
     }
 
     for (size_t i = 1; i < out_len; i++) {
         long long cur = file_mtime(cmd->outputs[i]);
+        if (cur == -1) return 1;
         if (cur < oldest_output) oldest_output = cur;
     }
 
@@ -281,6 +319,12 @@ static inline vec(const char *) zb_cmd_outputs(ZCmd *c) {
 
 static inline vec(const char *) zm_cmd_inputs(ZCmd *c) {
     return c->inputs;
+}
+
+static inline void zb_free_strs(vec(const char *) entries) {
+    for (size_t i = 0; i < veclen(entries); i++)
+        free((void *)entries[i]);
+    vecfree(entries);
 }
 
 static inline void zb_cmd_free(ZCmd *cmd) {
@@ -325,6 +369,13 @@ static inline void _zb_args(ZCmd *c, ...) {
         vecpush(c->argv, strdup(arg));
 
     va_end(ap);
+}
+
+static inline void zb_argsv(ZCmd *c, vec(const char *) args) {
+    size_t argv_len = veclen(c->argv), args_len = veclen(args);
+    vecreserve(c->argv, argv_len + args_len);
+    vecsetlen(c->argv, argv_len + args_len);
+    memcpy(c->argv + argv_len, args, args_len * sizeof(char *));
 }
 
 /* Append ONE argument built printf-style: zb_argf(c, "-DVERSION=%d", 3); */
@@ -386,72 +437,57 @@ static inline void zb_after(ZCmd *c, ZCmd *dep) {
     vecpush(c->after, dep);
 }
 
-/* ---- Self rebuild ---------------------------------------------------- */
-
-/* Put at the top of main(): if build.c, zbuild.c or zbuild.h is newer than
- * the running executable, recompile it and restart with the same arguments. */
-#define ZB_REBUILD_SELF(argc, argv) zb__rebuild_self((argc), (argv), __FILE__)
-static inline void zb__rebuild_self(int argc, char **argv, const char *build_src) {
-    (void)argc;
-    ZBuild *b = zb_new(0);
-    b->show_command = true;
-
-    ZCmd *c = zb_cmd(b, "clang");
-    zb_args(c, "-O2", "-Wall", "-Wextra");
-    zb_in(c, build_src);
-    zb_arg(c, "-o");
-    zb_out(c, argv[0]);
-
-    ZBuildState state = zb_run(b);
-    if (state == Z_BUILD_NOOP) return;
-    else printf("Rebuilding...\n");
-    if (state != Z_BUILD_DONE) exit(1);
-    execvp(argv[0], argv);
-    perror("execv");
-    exit(1);
-
-}
-
 /* ---- Utilities ------------------------------------------------------- */
 
-static inline vec(char) zb_shell(const char *cmd) {
-    vec(char) out = NULL;
+static inline int zb_shell(vec(char) *out, const char *cmd) {
     char line[512];
     FILE *f = popen(cmd, "r");
 
-    if (!f) return NULL;
+    if (!f) return -1;
 
     while (fgets(line, sizeof line, f)) {
         size_t linelen = strlen(line);
-        size_t outlen = veclen(out);
-        vecreserve(out, linelen);
-        vecsetlen(out, outlen + linelen);
-        memcpy(out + outlen, line, linelen);
+        size_t outlen = veclen(*out);
+        vecreserve(*out, outlen + linelen);
+        vecsetlen(*out, outlen + linelen);
+        memcpy(*out + outlen, line, linelen);
     }
-    pclose(f);
-    return out;
+    vecpush(*out, '\0');
+
+    int status = pclose(f);
+    if (status == -1) return -1;
+
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
 }
 
-static inline bool direxists(const char *path) {
 #ifdef _WIN32
 #   define STAT_STRUCT struct _stat
 #   define STAT_FUNC _stat
-#   define IS_DIR(m) (((m) & _S_IFDIR) != 0)
+#   define IS_DIR(m) (((m) & _S_IFMT) == _S_IFDIR)
 #else
 #   define STAT_STRUCT struct stat
 #   define STAT_FUNC stat
 #   define IS_DIR(m) S_ISDIR(m)
 #endif
 
+static inline bool zb_isdir(const char *path) {
     STAT_STRUCT info;
     if (STAT_FUNC(path, &info) != 0) {
         return false;
     }
     return IS_DIR(info.st_mode);
+
+}
+
+static inline bool zb_exists(const char *path) {
+    STAT_STRUCT info;
+    return STAT_FUNC(path, &info) == 0;
+}
+
 #undef STAT_FUNC
 #undef STAT_STRUCT
 #undef IS_DIR
-}
 
 static inline const char *zb_mkdir(const char *path) {
     if (!path || !*path) return path;
@@ -468,7 +504,7 @@ static inline const char *zb_mkdir(const char *path) {
         *slash = '\0';
 
         bool is_drive = (slash - copied == 2 && copied[1] == ':');
-        if (*copied != '\0' && !is_drive && !direxists(copied)) {
+        if (*copied != '\0' && !is_drive && !zb_exists(copied)) {
             MKDIR(copied);
         }
 
@@ -476,12 +512,140 @@ static inline const char *zb_mkdir(const char *path) {
         s = slash + 1;
     }
 
-    if (*copied != '\0' && !direxists(copied)) {
+    if (*copied != '\0' && !zb_exists(copied)) {
         MKDIR(copied);
     }
 
     free(copied);
     return path;
+}
+
+static inline bool zb_ls(const char *path, vec(const char *) *entries) {
+    size_t path_len = strlen(path);
+#ifdef _WIN32
+    char search_path[MAX_PATH];
+    snprintf(search_path, sizeof(search_path), "%s\\*", path);
+
+    WIN32_FIND_DATAA data;
+    HANDLE hFind = FindFirstFileA(search_path, &data);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    do {
+        if (strcmp(data.cFileName, ".") == 0 ||
+            strcmp(data.cFileName, "..") == 0)
+            continue;
+
+        size_t n = path_len + strlen(data.cFileName) + 2;
+        char *full = malloc(n);
+        if (!full) break;
+        snprintf(full, n, "%s\\%s", path, data.cFileName);
+        vecpush(*entries, full);
+    } while (FindNextFileA(hFind, &data));
+
+    FindClose(hFind);
+#else
+    DIR *d = opendir(path);
+    if (!d) return false;
+
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        size_t n = path_len + strlen(entry->d_name) + 2;
+        char *full = malloc(n);
+        if (!full) break;
+        snprintf(full, n, "%s/%s", path, entry->d_name);
+        vecpush(*entries, full);
+    }
+
+    closedir(d);
+#endif
+    return true;
+}
+
+typedef struct {
+    const char *suffix;
+    const char *skip;
+    bool (*fn)(const char *, void *);
+    void *ctx;
+} ZBWalkFilter;
+
+static vec(const char *) zb_walk(const char *root, ZBWalkFilter filter) {
+    vec(const char *) entries   = NULL;
+    vec(const char *) out       = NULL;
+
+    vecpush(entries, strdup(root));
+    for (size_t i = 0; i < veclen(entries); i++) {
+        const char *p = entries[i];
+        if (filter.skip && strstr(p, filter.skip)) continue;
+        else if (zb_isdir(p)) {
+            zb_ls(p, &entries);
+            continue;
+        }
+
+        if (filter.suffix && !zb_ends_with(p, filter.suffix)) continue;
+        else if (filter.fn && !filter.fn(p, filter.ctx)) continue;
+
+        vecpush(out, strdup(p));
+    }
+
+    zb_free_strs(entries);
+    return out;
+}
+
+static inline char *zb_path_map(const char *path,
+                                const char *from,
+                                const char *to,
+                                const char *ext) {
+    size_t from_len = strlen(from);
+    if (strncmp(path, from, from_len) != 0) return NULL;
+
+    const char *stem = path + from_len;
+    const char *slash = strrchr(stem, '/');
+    const char *dot = strrchr(slash, '.');
+    size_t stem_len = dot ? (size_t)(dot - stem) : strlen(stem);
+
+    size_t len = strlen(to) + stem_len + strlen(ext);
+    char *out = malloc(len);
+    if (!out) return NULL;
+    snprintf(out, len, "%s%.*s%s", to, (int)stem_len, stem, ext);
+    return out;
+}
+
+/* ---- Self rebuild ---------------------------------------------------- */
+
+/* Put at the top of main(): if build.c, zbuild.c or zbuild.h is newer than
+ * the running executable, recompile it and restart with the same arguments. */
+#define ZB_REBUILD_SELF(argc, argv) zb__rebuild_self((argc), (argv), __FILE__)
+static inline void zb__rebuild_self(int argc, char **argv, const char *build_src) {
+#ifdef _WIN32
+    (void)argc;
+    (void)argv;
+    (void)build_src;
+#else
+    (void)argc;
+    ZBuild *b = zb_new(0);
+    b->show_command = true;
+
+    ZCmd *c = zb_cmd(b, "clang");
+    zb_args(c, "-O2", "-Wall", "-Wextra");
+    zb_in(c, build_src);
+    zb_arg(c, "-o");
+    zb_out(c, argv[0]);
+
+    ZBuildState state = zb_run(b);
+
+    if (state == Z_BUILD_NOOP) return;
+    else printf("Rebuilding...\n");
+
+    if (state != Z_BUILD_DONE) exit(1);
+
+    execvp(argv[0], argv);
+    perror("execv");
+    exit(1);
+#endif
 }
 
 #endif /* ZBUILD_H */

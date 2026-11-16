@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: BSD-3-Clause
-// Copyright (c) 2025, Marco Menegazzi
-
 /**
  * @file zvec.h
  * @brief A lightweight, header-only dynamic array (vector) library for C
@@ -70,6 +67,9 @@
  * @author Marco Menegazzi
  * @date 2026
  * @version 1.0
+ *
+ * @copyright Copyright (c) 2025, Marco Menegazzi
+ *            SPDX-License-Identifier: BSD-3-Clause
  */
 
 #ifndef ZVEC_H
@@ -83,16 +83,17 @@
 
 // create a version which works also without zmem.h
 #ifdef ZVEC_USE_ZMEM
+#include "zmem.h"
 #define VECALLOC(a, s) aalloc(a, s)
 #define VECREALLOC(a, p, s) arealloc(a, p, s)
 #define VECFREE(a, p) afree(a, p)
+#define VEC_DEFAULT_ALLOCATOR (vecDefaultAllocator ? vecDefaultAllocator : heapAllocator)
 #else
 typedef struct Allocator Allocator;
-static Allocator *vecDefaultAllocator       = NULL;
-static Allocator *heapAllocator             = NULL;
 #define VECALLOC(a, s) malloc(s)
 #define VECREALLOC(a, p, s) realloc(p, s)
 #define VECFREE(a, p) free(p)
+#define VEC_DEFAULT_ALLOCATOR (NULL)
 #endif
 
 
@@ -187,7 +188,7 @@ static Allocator *heapAllocator             = NULL;
  * vecpush(vec, 100);
  * @endcode
  */
-#define vecpush(v, i) vecpushwith(v, i, vecDefaultAllocator ? vecDefaultAllocator : heapAllocator)
+#define vecpush(v, i) vecpushwith(v, i, VEC_DEFAULT_ALLOCATOR)
 
 #define vecpushwith(v, i, a)                                                    \
 do {                                                                            \
@@ -281,7 +282,7 @@ do {                                                                            
  * vecreserve(vec, 1000);  // Pre-allocate space for 1000 integers
  * @endcode
  */
-#define vecreserve(v, n) vecreservewith(v, n, vecDefaultAllocator ? vecDefaultAllocator : heapAllocator)
+#define vecreserve(v, n) vecreservewith(v, n, VEC_DEFAULT_ALLOCATOR)
 
 #define vecreservewith(v, n, a)                                                 \
 do {                                                                            \
