@@ -1,7 +1,7 @@
 /*
  * zbuild.h - a tiny build system for C. Public API.
  *
- * Bootstrap once:  cc -o build build.c zbuild.c
+ * Bootstrap once:  cc -o build build.c
  * Then just run:   ./build
  */
 #ifndef ZBUILD_H
@@ -29,7 +29,7 @@
 #   include <sched.h>
 #endif
 
-#include "zvec.h"
+// #include "zvec.h"
 
 #define VFORMAT() ({                                                            \
     va_list ap;                                                                 \
@@ -151,7 +151,7 @@ static inline int zb_run_command(ZBuild *b, ZCmd *c) {
 #else
     char slash = '/';
 #endif
-    
+
     for (size_t i = 0; i < veclen(c->outputs); i++) {
         const char *last_slash = strrchr(c->outputs[i], slash);
         if (!last_slash) continue;
@@ -286,7 +286,7 @@ static inline int zb_is_out_of_date(ZCmd *cmd) {
 
     if (newest_input == -1 || oldest_output == -1)
         return 1;
-    
+
     for (size_t i = 1; i < in_len; i++) {
         long long cur = file_mtime(cmd->inputs[i]);
         if (cur == -1) return 1;
@@ -359,6 +359,10 @@ static inline char *vformat(const char *fmt, va_list args) {
     return out;
 }
 
+static inline const char *zb_sprint(const char *fmt, ...) {
+    return VFORMAT();
+}
+
 #define zb_args(c, ...) _zb_args(c, __VA_ARGS__, NULL)
 static inline void _zb_args(ZCmd *c, ...) {
     va_list ap;
@@ -380,6 +384,7 @@ static inline void zb_argsv(ZCmd *c, vec(const char *) args) {
 
 /* Append ONE argument built printf-style: zb_argf(c, "-DVERSION=%d", 3); */
 static inline void zb_arg(ZCmd *c, const char *fmt, ...) {
+    if (!fmt) return;
     const char *arg = VFORMAT();
     vecpush(c->argv, arg);
 }
@@ -397,6 +402,63 @@ static inline void zb_output(ZCmd *c, const char *fmt, ...) {
     vecpush(c->outputs, strdup(path));
 }
 
+static inline bool zb__in_set(char c, const char *t) {
+    for (; *t; t++) if (c == *t) return true;
+    return false;
+}
+
+static inline int zb_trim_start(vec(char) s, const char *t) {
+    size_t len = veclen(s), i = 0;
+    while (i < len && zb__in_set(s[i], t)) i++;
+
+    if (i == 0) return 0;
+    memmove(s, s + i, len - i);
+    s[len - i] = '\0';
+    return i;
+}
+
+static inline int zb_trim_end(vec(char) s, const char *t) {
+    size_t len = veclen(s), n = len;
+    while (n > 0 && zb__in_set(s[n - 1], t)) n--;
+    if (n == len) return 0;
+    vecsetlen(s, n);
+    s[n] = '\0';
+    return len - n;
+}
+
+static inline int zb_trim(vec(char) s, const char *t) {
+    return zb_trim_start(s, t) + zb_trim_end(s, t);
+}
+
+static inline vec(const char *) zb_split(const char *src, const char *delim) {
+    vec(const char *) out = NULL;
+    const char *p;
+
+    size_t delim_len = strlen(delim);
+
+    if (delim_len == 0) return NULL;
+
+    while(( p = strstr(src, delim) )) {
+        size_t len = p - src;
+        vecpush(out, strndup(src, len));
+        src = p + delim_len;
+    }
+
+    vecpush(out, strdup(src));
+    return out;
+}
+
+static inline vec(const char *) zb_split_any(const char *src, const char *delim) {
+    vec(const char *) out = NULL;
+    while(*src) {
+        src += strspn(src, delim);
+        size_t len = strcspn(src, delim);
+        if (len == 0) break;
+        vecpush(out, strndup(src, len));
+        src += len;
+    }
+    return out;
+}
 
 /* Append `path` as an argument AND record it as an input / output. */
 static inline void zb_in(ZCmd *c, const char *fmt, ...) {
@@ -445,14 +507,20 @@ static inline int zb_shell(vec(char) *out, const char *cmd) {
 
     if (!f) return -1;
 
-    while (fgets(line, sizeof line, f)) {
-        size_t linelen = strlen(line);
-        size_t outlen = veclen(*out);
-        vecreserve(*out, outlen + linelen);
-        vecsetlen(*out, outlen + linelen);
-        memcpy(*out + outlen, line, linelen);
+    if (out) {
+        while (fgets(line, sizeof line, f)) {
+            size_t linelen = strlen(line);
+            size_t outlen = veclen(*out);
+            vecreserve(*out, outlen + linelen);
+            vecsetlen(*out, outlen + linelen);
+            memcpy(*out + outlen, line, linelen);
+        }
+
+        zb_trim(*out, " \n");
+
+        vecpush(*out, '\0');
+        // vecsetlen(*out, veclen(*out) - 1);
     }
-    vecpush(*out, '\0');
 
     int status = pclose(f);
     if (status == -1) return -1;
@@ -565,12 +633,35 @@ static inline bool zb_ls(const char *path, vec(const char *) *entries) {
     return true;
 }
 
+
 typedef struct {
-    const char *suffix;
-    const char *skip;
+    const char **suffix;
+    const char **skip;
     bool (*fn)(const char *, void *);
     void *ctx;
 } ZBWalkFilter;
+
+#define ZB_LIST(...) ((const char *[]){ __VA_ARGS__, NULL })
+
+static inline bool zb__filter_skip(const char *p, ZBWalkFilter filter) {
+    if (!filter.skip) return false;
+    const char **skip = filter.skip;
+    while (*skip) {
+        if (strstr(p, *skip)) return true;
+        skip++;
+    }
+    return false;
+}
+
+static inline bool zb__filter_suffix(const char *p, ZBWalkFilter filter) {
+    if (!filter.suffix) return true;
+    const char **suffix = filter.suffix;
+    while (*suffix) {
+        if (zb_ends_with(p, *suffix)) return true;
+        suffix++;
+    }
+    return false;
+}
 
 static vec(const char *) zb_walk(const char *root, ZBWalkFilter filter) {
     vec(const char *) entries   = NULL;
@@ -579,14 +670,16 @@ static vec(const char *) zb_walk(const char *root, ZBWalkFilter filter) {
     vecpush(entries, strdup(root));
     for (size_t i = 0; i < veclen(entries); i++) {
         const char *p = entries[i];
-        if (filter.skip && strstr(p, filter.skip)) continue;
-        else if (zb_isdir(p)) {
+
+        if (zb__filter_skip(p, filter)) continue;
+
+        if (zb_isdir(p)) {
             zb_ls(p, &entries);
             continue;
         }
 
-        if (filter.suffix && !zb_ends_with(p, filter.suffix)) continue;
-        else if (filter.fn && !filter.fn(p, filter.ctx)) continue;
+        if (!zb__filter_suffix(p, filter)) continue;
+        if (filter.fn && !filter.fn(p, filter.ctx)) continue;
 
         vecpush(out, strdup(p));
     }
@@ -604,10 +697,10 @@ static inline char *zb_path_map(const char *path,
 
     const char *stem = path + from_len;
     const char *slash = strrchr(stem, '/');
-    const char *dot = strrchr(slash, '.');
+    const char *dot = strrchr(slash ? slash : stem, '.');
     size_t stem_len = dot ? (size_t)(dot - stem) : strlen(stem);
 
-    size_t len = strlen(to) + stem_len + strlen(ext);
+    size_t len = strlen(to) + stem_len + strlen(ext) + 1;
     char *out = malloc(len);
     if (!out) return NULL;
     snprintf(out, len, "%s%.*s%s", to, (int)stem_len, stem, ext);
