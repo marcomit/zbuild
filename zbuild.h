@@ -1,9 +1,14 @@
-/*
- * zbuild.h - a tiny build system for C. Public API.
+/**
+ * @file zbuild.h
+ * @brief A tiny build system for C. Public API.
  *
  * Bootstrap once:  cc -o build build.c
  * Then just run:   ./build
+ *
+ * @copyright Copyright (c) 2025, Marco Menegazzi
+ *            SPDX-License-Identifier: BSD-3-Clause
  */
+
 #ifndef ZBUILD_H
 #define ZBUILD_H
 
@@ -12,32 +17,28 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <dirent.h>
-#include <sys/wait.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #if defined(_WIN32)
 #   include <windows.h>
+#   include <direct.h>
 #   define MKDIR(path) _mkdir(path)
 #   define popen _popen
 #   define pclose _pclose
 #else
+#   include <dirent.h>
 #   include <unistd.h>
-#   include <sys/stat.h>
+#   include <sys/wait.h>
 #   define MKDIR(path) mkdir(path, 0755)
 #endif
-#ifdef __linux__
-#   include <sched.h>
+
+#ifdef _WIN32
+typedef HANDLE ZProc;
+#else
+typedef pid_t  ZProc;
 #endif
-
-// #include "zvec.h"
-
-#define VFORMAT() ({                                                            \
-    va_list ap;                                                                 \
-    va_start(ap, fmt);                                                          \
-    const char *formatted = vformat(fmt, ap);                                   \
-    va_end(ap);                                                                 \
-    formatted;                                                                  \
-})
 
 typedef struct ZCmd   ZCmd;     /* one command (argv + files + deps) */
 typedef struct ZBuild ZBuild;   /* a set of commands                 */
@@ -51,7 +52,7 @@ typedef enum {
 
 struct ZBuild {
     vec(ZCmd *) cmds;
-    size_t max_jobs;
+    int max_jobs;
     bool show_command;
     bool show_output;
     bool show_skipped_command;
@@ -68,12 +69,13 @@ typedef enum {
 } ZCmdState;
 
 struct ZCmd {
-    vec(const char *)   argv;
-    vec(const char *)   inputs;
-    vec(const char *)   outputs;
-    vec(ZCmd *)         after;
-    size_t               remaining;
-    ZCmdState           state;
+    vec(zstr)   argv;
+    vec(zstr)   inputs;
+    vec(zstr)   outputs;
+    vec(ZCmd *) after;
+    size_t      remaining;
+    ZCmdState   state;
+    ZProc       proc;
 };
 
 static inline void zb_cmd_free(ZCmd *);
@@ -81,28 +83,9 @@ static inline int zb_is_out_of_date(ZCmd *);
 static inline char *zb_get_cmd(ZCmd *);
 static inline const char *zb_mkdir(const char *);
 
-static inline bool zb_starts_with(const char *src, const char *prefix) {
-    return strncmp(src, prefix, strlen(prefix)) == 0;
-}
-
-static inline bool zb_ends_with(const char *src, const char *suffix) {
-    size_t suffix_len   = strlen(suffix);
-    size_t src_len      = strlen(src);
-    if (suffix_len > src_len) return false;
-    return strcmp(src + (src_len - suffix_len), suffix) == 0;
-}
-
 static inline int cpu_count() {
 #if defined(_WIN32)
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    return n > 0 ? (int)n : 1;
-#elif defined(__linux__)
-    cpu_set_t set;
-    if (sched_getaffinity(0, sizeof set, &set) == 0) {
-        int n = CPU_COUNT(&set);
-        if (n > 0) return n;
-    }
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -114,7 +97,10 @@ static inline int cpu_count() {
 static inline ZBuild *zb_new(int jobs) {
     ZBuild *self = (ZBuild *)malloc(sizeof(ZBuild));
     *self = (ZBuild){ 0 };
-    self->max_jobs = jobs == 0 ? cpu_count() : jobs;
+    self->max_jobs = jobs <= 0 ? cpu_count() : jobs;
+#ifdef _WIN32
+    if (self->max_jobs > MAXIMUM_WAIT_OBJECTS) self->max_jobs = MAXIMUM_WAIT_OBJECTS;
+#endif
     return self;
 }
 
@@ -140,72 +126,142 @@ static inline int zb_has_cycle(ZCmd *cmd) {
     return 0;
 }
 
-static inline int zb_run_command(ZBuild *b, ZCmd *c) {
-    const char *cmd = zb_get_cmd(c);
-    if (b->show_command) {
-        printf("[zb]: %s\n", cmd);
-    }
-
-#ifdef _WIN32
-    char slash = '\\';
-#else
-    char slash = '/';
-#endif
-
-    for (size_t i = 0; i < veclen(c->outputs); i++) {
-        const char *last_slash = strrchr(c->outputs[i], slash);
-        if (!last_slash) continue;
-        char *path = strndup(c->outputs[i], last_slash - c->outputs[i]);
-        zb_mkdir(path);
-        free(path);
-    }
-
-    return system(cmd);
-}
-
-static inline int zb_walk_cmd(ZBuild *b, ZCmd *c) {
-    if (c->state & Z_CMD_END_MASK) return 0;
-    c->state = Z_CMD_RUNNING;
-
-    size_t i = 0;
-    for (; i < veclen(c->after); i++) {
-        if (!zb_is_out_of_date(c->after[i])) continue;
-        if (!zb_walk_cmd(b, c->after[i])) {
-            c->state = Z_CMD_SKIPPED;
-            break;
-        }
-    }
-
-    if (c->state == Z_CMD_SKIPPED) {
-        for (; i < veclen(c->after); i++) {
-            c->after[i]->state = Z_CMD_SKIPPED;
-        }
-    }
-
-    if (c->state != Z_CMD_RUNNING) {
-        if (b->show_skipped_command) {
-            printf("Command %s skipped\n", zb_get_cmd(c));
-        }
-        return 0;
-    }
-
-    int code = zb_run_command(b, c);
-    if (code != 0) {
-        c->state = Z_CMD_FAILED;
-        return 0;
-    } else {
-        c->state = Z_CMD_DONE;
-        return 1;
-    }
-}
-
 static inline void zb_set_all_pendings(ZBuild *b) {
     for (size_t i = 0; i < veclen(b->cmds); i++)
         b->cmds[i]->state = Z_CMD_PENDING;
 }
 
-/* Run every out-of-date command, in parallel where dependencies allow.
- * Returns 0 on success, 1 if a command failed or there is a cycle. */
+static inline int zb__deps_ready(ZCmd *c) {
+    for (size_t i = 0; i < veclen(c->after); i++) switch (c->after[i]->state) {
+        case Z_CMD_FAILED:
+        case Z_CMD_SKIPPED: return -1;
+        case Z_CMD_DONE:    break;
+        default:            return 0;
+    }
+    return 1;
+}
+
+static inline void zb__print_and_mkdir(ZBuild *b, ZCmd *c) {
+    if (b->show_command) {
+        char *s = zb_get_cmd(c);
+        printf("[zb]: %s\n", s);
+        vecfree(s);
+    }
+
+    for (size_t i = 0; i < veclen(c->outputs); i++) {
+        const char *o = c->outputs[i];
+        const char *fwd = strrchr(o, '/');
+        const char *back = strrchr(o, '\\');
+        const char *slash = !back || (fwd && fwd > back) ? fwd : back;
+        if (!slash) continue;
+        zstr dir = zs_newn(o, slash - o);
+        zb_mkdir(dir);
+        zs_free(dir);
+    }
+}
+
+#ifdef _WIN32
+static inline void zb__win_quote(char **line, const char *arg) {
+    if (*arg && !strpbrk(arg, " \t\n\v\"")) {
+        vecunion(*line, arg, strlen(arg));
+        return;
+    }
+    vecpush(*line, '"');
+    for (const char *p = arg;; p++) {
+        size_t bs = 0;
+        while (*p == '\\') { bs++; p++; }
+        if (!*p) {
+            for (size_t i = 0; i < bs * 2; i++) vecpush(*line, '\\');
+            break;
+        }
+        if (*p == '"') {
+            for (size_t i = 0; i < bs * 2 + 1; i++) vecpush(*line, '\\');
+        } else {
+            for (size_t i = 0; i < bs; i++) vecpush(*line, '\\');
+        }
+        vecpush(*line, *p);
+    }
+    vecpush(*line, '"');
+}
+#endif
+
+static inline bool zb__spawn(ZCmd *c) {
+    fflush(stdout);
+    fflush(stderr);
+#ifdef _WIN32
+    char *line = NULL;
+    for (size_t i = 0; i < veclen(c->argv); i++) {
+        if (i) vecpush(line, ' ');
+        zb__win_quote(&line, c->argv[i]);
+    }
+    vecpush(line, '\0');
+
+    STARTUPINFOA si = { .cb = sizeof si };
+    PROCESS_INFORMATION pi;
+    BOOL ok = CreateProcessA(NULL, line, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    vecfree(line);
+    if (!ok) return false;
+    CloseHandle(pi.hThread);
+    c->proc = pi.hProcess;
+    return true;
+#else
+    size_t n = veclen(c->argv);
+    char **argv = (char **)malloc(sizeof(char *) * (n + 1));
+    for (size_t i = 0; i < n; i++) argv[i] = c->argv[i];
+    argv[n] = NULL;
+
+    pid_t p = fork();
+    if (p == 0) {
+        execvp(argv[0], argv);
+        perror(argv[0]);
+        _exit(127);
+    }
+    free(argv);
+    if (p < 0) return false;
+    c->proc = p;
+    return true;
+#endif
+}
+
+static inline ZCmd *zb__wait_any(ZBuild *b, bool *ok) {
+#ifdef _WIN32
+    HANDLE hs[MAXIMUM_WAIT_OBJECTS];
+    ZCmd  *cs[MAXIMUM_WAIT_OBJECTS];
+    DWORD n = 0;
+    for (size_t i = 0; i < veclen(b->cmds) && n < MAXIMUM_WAIT_OBJECTS; i++)
+        if (b->cmds[i]->state == Z_CMD_RUNNING) {
+            hs[n] = b->cmds[i]->proc;
+            cs[n++] = b->cmds[i];
+        }
+
+    DWORD r = WaitForMultipleObjects(n, hs, FALSE, INFINITE);
+    if (r >= WAIT_OBJECT_0 + n) return NULL;
+
+    ZCmd *c = cs[r - WAIT_OBJECT_0];
+    DWORD code = 1;
+    GetExitCodeProcess(c->proc, &code);
+    CloseHandle(c->proc);
+    *ok = code == 0;
+    return c;
+#else
+    for (;;) {
+        int status;
+        pid_t p = waitpid(-1, &status, 0);
+        if (p < 0) {
+            if (errno == EINTR) continue;
+            return NULL;
+        }
+        for (size_t i = 0; i < veclen(b->cmds); i++) {
+            ZCmd *c = b->cmds[i];
+            if (c->state == Z_CMD_RUNNING && c->proc == p) {
+                *ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+                return c;
+            }
+        }
+    }
+#endif
+}
+
 static inline ZBuildState zb_run(ZBuild *b) {
     zb_set_all_pendings(b);
 
@@ -215,19 +271,56 @@ static inline ZBuildState zb_run(ZBuild *b) {
 
     zb_set_all_pendings(b);
 
-    int flag = 0;
-    for (size_t i = 0; i < veclen(b->cmds); i++) {
-        if (zb_is_out_of_date(b->cmds[i])) {
-            if (!zb_walk_cmd(b, b->cmds[i])) {
-                return Z_BUILD_GENERIC_ERROR;
+    int running = 0;
+    bool failed = false, did_work = false;
+    for (;;) {
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (size_t i = 0; i < veclen(b->cmds); i++) {
+                ZCmd *c = b->cmds[i];
+                if (c->state != Z_CMD_PENDING) continue;
+
+                int r = zb__deps_ready(c);
+                if (r < 0) {
+                    c->state = Z_CMD_SKIPPED;
+                    progress = true;
+                    continue;
+                } else if (r == 0) continue;
+
+                if (!zb_is_out_of_date(c)) {
+                    c->state = Z_CMD_DONE;
+                    progress = true;
+                    continue;
+                }
+
+                if (failed || running >= b->max_jobs) continue;
+
+                zb__print_and_mkdir(b, c);
+                if (!zb__spawn(c)) {
+                    c->state = Z_CMD_FAILED;
+                    failed = true;
+                    continue;
+                }
+
+                c->state = Z_CMD_RUNNING;
+                running++;
+                did_work = true;
             }
-            flag = 1;
-        } else if (b->show_skipped_command) {
-            printf("Command %s is out of date\n", zb_get_cmd(b->cmds[i]));
         }
+
+        if (running == 0) break;
+
+        bool ok = false;
+        ZCmd *c = zb__wait_any(b, &ok);
+        if (!c) break;
+        running--;
+        c->state = ok ? Z_CMD_DONE : Z_CMD_FAILED;
+        if (!ok) failed = true;
     }
 
-    return flag ? Z_BUILD_DONE : Z_BUILD_NOOP;
+    if (failed) return Z_BUILD_GENERIC_ERROR;
+    return did_work ? Z_BUILD_DONE : Z_BUILD_NOOP;
 }
 
 /* Delete every output file and depfile. */
@@ -245,6 +338,7 @@ static inline void zb_clean(ZBuild *b) {
 static inline void zb_free(ZBuild *b) {
     for (size_t i = 0; i < veclen(b->cmds); i++)
         zb_cmd_free(b->cmds[i]);
+    vecfree(b->cmds);
     free(b);
 }
 
@@ -307,60 +401,29 @@ static inline int zb_is_out_of_date(ZCmd *cmd) {
 static inline ZCmd *zb_cmd(ZBuild *b, const char *program) {
     ZCmd *self = (ZCmd *)malloc(sizeof(ZCmd));
     *self = (ZCmd){ 0 };
-    vecpush(self->argv, strdup(program));
+    vecpush(self->argv, zs_new(program));
     vecpush(b->cmds, self);
     return self;
 }
 
 /* Get the outputs of a command. */
-static inline vec(const char *) zb_cmd_outputs(ZCmd *c) {
+static inline vec(zstr) zb_cmd_outputs(ZCmd *c) {
     return c->outputs;
 }
 
-static inline vec(const char *) zm_cmd_inputs(ZCmd *c) {
+static inline vec(zstr) zm_cmd_inputs(ZCmd *c) {
     return c->inputs;
 }
 
-static inline void zb_free_strs(vec(const char *) entries) {
-    for (size_t i = 0; i < veclen(entries); i++)
-        free((void *)entries[i]);
-    vecfree(entries);
-}
-
 static inline void zb_cmd_free(ZCmd *cmd) {
-    #define freelist(l) for (size_t i = 0; i < veclen(l); i++) free((void *)l[i]);
-    freelist(cmd->argv);
-    freelist(cmd->inputs);
-    freelist(cmd->outputs);
-    #undef freelist
+    if (!cmd) return;
 
-    for (size_t i = 0; i < veclen(cmd->after); i++) {
-        zb_cmd_free(cmd->after[i]);
-        cmd->after[i] = NULL;
-    }
+    zs_free_all(cmd->argv);
+    zs_free_all(cmd->inputs);
+    zs_free_all(cmd->outputs);
 
-    vecfree(cmd->argv);
-    vecfree(cmd->inputs);
-    vecfree(cmd->outputs);
     vecfree(cmd->after);
-
     free(cmd);
-}
-
-static inline char *vformat(const char *fmt, va_list args) {
-    va_list copy;
-    va_copy(copy, args);
-    int len = vsnprintf(NULL, 0, fmt, copy);
-    va_end(copy);
-    if (len < 0) return NULL;
-
-    char *out = (char *)malloc((size_t)len + 1);
-    if (out) vsnprintf(out, (size_t)len + 1, fmt, args);
-    return out;
-}
-
-static inline const char *zb_sprint(const char *fmt, ...) {
-    return VFORMAT();
 }
 
 #define zb_args(c, ...) _zb_args(c, __VA_ARGS__, NULL)
@@ -370,108 +433,56 @@ static inline void _zb_args(ZCmd *c, ...) {
     va_start(ap, c);
 
     while (( arg = va_arg(ap, const char *)))
-        vecpush(c->argv, strdup(arg));
+        vecpush(c->argv, zs_new(arg));
 
     va_end(ap);
 }
 
 static inline void zb_argsv(ZCmd *c, vec(const char *) args) {
-    size_t argv_len = veclen(c->argv), args_len = veclen(args);
-    vecreserve(c->argv, argv_len + args_len);
-    vecsetlen(c->argv, argv_len + args_len);
-    memcpy(c->argv + argv_len, args, args_len * sizeof(char *));
+    for (size_t i = 0; i < veclen(args); i++)
+        vecpush(c->argv, zs_new(args[i]));
 }
 
 /* Append ONE argument built printf-style: zb_argf(c, "-DVERSION=%d", 3); */
 static inline void zb_arg(ZCmd *c, const char *fmt, ...) {
     if (!fmt) return;
-    const char *arg = VFORMAT();
-    vecpush(c->argv, arg);
+    va_list ap;
+    va_start(ap, fmt);
+
+    vecpush(c->argv, zs_vfmt(fmt, ap));
+    va_end(ap);
 }
 
 /* ---- Files ----------------------------------------------------------- */
 
 /* Record a file without adding an argument (headers, side outputs...). */
 static inline void zb_input (ZCmd *c, const char *fmt, ...) {
-    const char *path = VFORMAT();
-    vecpush(c->inputs, strdup(path));
+    va_list ap; va_start(ap, fmt);
+    vecpush(c->inputs, zs_vfmt(fmt, ap));
+    va_end(ap);
 }
 
 static inline void zb_output(ZCmd *c, const char *fmt, ...) {
-    const char *path = VFORMAT();
-    vecpush(c->outputs, strdup(path));
-}
-
-static inline bool zb__in_set(char c, const char *t) {
-    for (; *t; t++) if (c == *t) return true;
-    return false;
-}
-
-static inline int zb_trim_start(vec(char) s, const char *t) {
-    size_t len = veclen(s), i = 0;
-    while (i < len && zb__in_set(s[i], t)) i++;
-
-    if (i == 0) return 0;
-    memmove(s, s + i, len - i);
-    s[len - i] = '\0';
-    return i;
-}
-
-static inline int zb_trim_end(vec(char) s, const char *t) {
-    size_t len = veclen(s), n = len;
-    while (n > 0 && zb__in_set(s[n - 1], t)) n--;
-    if (n == len) return 0;
-    vecsetlen(s, n);
-    s[n] = '\0';
-    return len - n;
-}
-
-static inline int zb_trim(vec(char) s, const char *t) {
-    return zb_trim_start(s, t) + zb_trim_end(s, t);
-}
-
-static inline vec(const char *) zb_split(const char *src, const char *delim) {
-    vec(const char *) out = NULL;
-    const char *p;
-
-    size_t delim_len = strlen(delim);
-
-    if (delim_len == 0) return NULL;
-
-    while(( p = strstr(src, delim) )) {
-        size_t len = p - src;
-        vecpush(out, strndup(src, len));
-        src = p + delim_len;
-    }
-
-    vecpush(out, strdup(src));
-    return out;
-}
-
-static inline vec(const char *) zb_split_any(const char *src, const char *delim) {
-    vec(const char *) out = NULL;
-    while(*src) {
-        src += strspn(src, delim);
-        size_t len = strcspn(src, delim);
-        if (len == 0) break;
-        vecpush(out, strndup(src, len));
-        src += len;
-    }
-    return out;
+    va_list ap; va_start(ap, fmt);
+    vecpush(c->outputs, zs_vfmt(fmt, ap));
+    va_end(ap);
 }
 
 /* Append `path` as an argument AND record it as an input / output. */
 static inline void zb_in(ZCmd *c, const char *fmt, ...) {
-    const char *path = VFORMAT();
-    vecpush(c->argv, strdup(path));
-    vecpush(c->inputs, strdup(path));
+    va_list ap; va_start(ap, fmt);
+    zstr s = zs_vfmt(fmt, ap);
+    va_end(ap);
+    vecpush(c->argv, s);
+    vecpush(c->inputs, zs_dup(s));
 }
 
 static inline void zb_out(ZCmd *c, const char *fmt, ...) {
-    const char *path = VFORMAT();
-    vecpush(c->argv, strdup(path));
-    vecpush(c->outputs, strdup(path));
-
+    va_list ap; va_start(ap, fmt);
+    zstr s = zs_vfmt(fmt, ap);
+    va_end(ap);
+    vecpush(c->argv, s);
+    vecpush(c->outputs, zs_dup(s));
 }
 
 /* A gcc/clang depfile (-MMD -MF path); headers listed in it become inputs. */
@@ -501,32 +512,22 @@ static inline void zb_after(ZCmd *c, ZCmd *dep) {
 
 /* ---- Utilities ------------------------------------------------------- */
 
-static inline int zb_shell(vec(char) *out, const char *cmd) {
+static inline int zb_shell(zstr *out, const char *cmd) {
     char line[512];
     FILE *f = popen(cmd, "r");
 
     if (!f) return -1;
 
-    if (out) {
-        while (fgets(line, sizeof line, f)) {
-            size_t linelen = strlen(line);
-            size_t outlen = veclen(*out);
-            vecreserve(*out, outlen + linelen);
-            vecsetlen(*out, outlen + linelen);
-            memcpy(*out + outlen, line, linelen);
-        }
-
-        zb_trim(*out, " \n");
-
-        vecpush(*out, '\0');
-        // vecsetlen(*out, veclen(*out) - 1);
-    }
+    if (out) while (fgets(line, sizeof line, f))
+        zs_catn(out, line, strlen(line));
 
     int status = pclose(f);
-    if (status == -1) return -1;
-
+#ifdef _WIN32
+    return status;
+#else
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     return -1;
+#endif
 }
 
 #ifdef _WIN32
@@ -560,10 +561,9 @@ static inline bool zb_exists(const char *path) {
 static inline const char *zb_mkdir(const char *path) {
     if (!path || !*path) return path;
 
-    char *copied = strdup(path);
-    if (!copied) return NULL;
+    zstr copied = zs_new(path);
 
-    char *s = copied;
+    const char *s = copied;
     while (true) {
         char *slash = strpbrk(s, "/\\");
         if (!slash) break;
@@ -584,15 +584,14 @@ static inline const char *zb_mkdir(const char *path) {
         MKDIR(copied);
     }
 
-    free(copied);
+    zs_free(copied);
     return path;
 }
 
-static inline bool zb_ls(const char *path, vec(const char *) *entries) {
-    size_t path_len = strlen(path);
+static inline bool zb_ls(const char *path, vec(zstr) *entries) {
 #ifdef _WIN32
     char search_path[MAX_PATH];
-    snprintf(search_path, sizeof(search_path), "%s\\*", path);
+    snprintf(search_path, sizeof(search_path), "%s/*", path);
 
     WIN32_FIND_DATAA data;
     HANDLE hFind = FindFirstFileA(search_path, &data);
@@ -603,11 +602,7 @@ static inline bool zb_ls(const char *path, vec(const char *) *entries) {
             strcmp(data.cFileName, "..") == 0)
             continue;
 
-        size_t n = path_len + strlen(data.cFileName) + 2;
-        char *full = malloc(n);
-        if (!full) break;
-        snprintf(full, n, "%s\\%s", path, data.cFileName);
-        vecpush(*entries, full);
+        vecpush(*entries, zs_fmt("%s/%s", path, data.cFileName));
     } while (FindNextFileA(hFind, &data));
 
     FindClose(hFind);
@@ -620,12 +615,7 @@ static inline bool zb_ls(const char *path, vec(const char *) *entries) {
         if (strcmp(entry->d_name, ".") == 0 ||
             strcmp(entry->d_name, "..") == 0)
             continue;
-
-        size_t n = path_len + strlen(entry->d_name) + 2;
-        char *full = malloc(n);
-        if (!full) break;
-        snprintf(full, n, "%s/%s", path, entry->d_name);
-        vecpush(*entries, full);
+        vecpush(*entries, zs_fmt("%s/%s", path, entry->d_name));
     }
 
     closedir(d);
@@ -657,17 +647,17 @@ static inline bool zb__filter_suffix(const char *p, ZBWalkFilter filter) {
     if (!filter.suffix) return true;
     const char **suffix = filter.suffix;
     while (*suffix) {
-        if (zb_ends_with(p, *suffix)) return true;
+        if (zs_ends(p, *suffix)) return true;
         suffix++;
     }
     return false;
 }
 
-static vec(const char *) zb_walk(const char *root, ZBWalkFilter filter) {
-    vec(const char *) entries   = NULL;
-    vec(const char *) out       = NULL;
+static vec(zstr) zb_walk(const char *root, ZBWalkFilter filter) {
+    vec(zstr) entries   = NULL;
+    vec(zstr) out       = NULL;
 
-    vecpush(entries, strdup(root));
+    vecpush(entries, zs_new(root));
     for (size_t i = 0; i < veclen(entries); i++) {
         const char *p = entries[i];
 
@@ -681,14 +671,14 @@ static vec(const char *) zb_walk(const char *root, ZBWalkFilter filter) {
         if (!zb__filter_suffix(p, filter)) continue;
         if (filter.fn && !filter.fn(p, filter.ctx)) continue;
 
-        vecpush(out, strdup(p));
+        vecpush(out, zs_new(p));
     }
 
-    zb_free_strs(entries);
+    zs_free_all(entries);
     return out;
 }
 
-static inline char *zb_path_map(const char *path,
+static inline zstr zb_path_map(const char *path,
                                 const char *from,
                                 const char *to,
                                 const char *ext) {
@@ -700,11 +690,7 @@ static inline char *zb_path_map(const char *path,
     const char *dot = strrchr(slash ? slash : stem, '.');
     size_t stem_len = dot ? (size_t)(dot - stem) : strlen(stem);
 
-    size_t len = strlen(to) + stem_len + strlen(ext) + 1;
-    char *out = malloc(len);
-    if (!out) return NULL;
-    snprintf(out, len, "%s%.*s%s", to, (int)stem_len, stem, ext);
-    return out;
+    return zs_fmt("%s%.*s%s", to, (int)stem_len, stem, ext);
 }
 
 /* ---- Self rebuild ---------------------------------------------------- */
